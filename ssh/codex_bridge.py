@@ -167,7 +167,7 @@ class CodexWSClient:
             self._connected = False
 
     async def _handle_server_request(self, msg: Dict) -> None:
-        """Auto-respond to Codex server requests (approvals, elicitation)."""
+        """Auto-respond to Codex server requests (approvals, elicitation, MCP tool calls)."""
         req_id = msg.get("id")
         method = msg.get("method", "")
         if req_id is None:
@@ -180,6 +180,20 @@ class CodexWSClient:
             response = {"action": "decline", "content": None}
         elif method == "item/tool/requestUserInput":
             response = {"answers": {}}
+        elif method == "mcpServer/tool/call":
+            # Handle MCP tool call requests
+            params = msg.get("params", {})
+            server_name = params.get("server", "")
+            tool_name = params.get("tool", "")
+            arguments = params.get("arguments", {})
+            logger.info("MCP tool call request: server=%s tool=%s", server_name, tool_name)
+
+            # For now, return a stub response - actual MCP execution would
+            # require calling the MCP server's tool endpoint
+            response = {
+                "content": [{"type": "text", "text": f"MCP tool {server_name}/{tool_name} called"}],
+                "isError": False,
+            }
         else:
             response = {}
 
@@ -310,6 +324,10 @@ async def codex_turn(req: TurnRequest):
         # Extract the latest user message from events
         user_text = _extract_user_message(req.events)
 
+        # Register MCP servers if provided
+        if req.tenant_mcp_servers:
+            await _register_mcp_servers(req.tenant_mcp_servers)
+
         # Start or reuse a thread
         thread_id = await _start_thread(req.session_id, user_text)
 
@@ -369,6 +387,10 @@ async def codex_turn_sse(req: TurnRequest):
         try:
             user_text = _extract_user_message(req.events)
 
+            # Register MCP servers if provided
+            if req.tenant_mcp_servers:
+                await _register_mcp_servers(req.tenant_mcp_servers)
+
             thread_id = await _start_thread(req.session_id, user_text)
 
             # Codex expects input as a list of content blocks, not a plain string
@@ -410,6 +432,49 @@ async def codex_turn_sse(req: TurnRequest):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+async def _register_mcp_servers(servers: list) -> None:
+    """Register MCP servers with the Codex app-server via config/value/write."""
+    for server in servers or []:
+        name = server.get("name")
+        url = server.get("url")
+        if not name or not url:
+            logger.warning("skipping MCP server with missing name or url: %s", server)
+            continue
+
+        config_value = {
+            "url": url,
+            "type": server.get("type", "url"),
+        }
+        if server.get("authorization_token"):
+            config_value["authorization_token"] = server["authorization_token"]
+
+        try:
+            await _client.call("config/value/write", {
+                "keyPath": f"mcp_servers.{name}",
+                "value": config_value,
+                "mergeStrategy": "replace",
+            })
+            logger.info("registered MCP server: %s -> %s", name, url)
+        except Exception as e:
+            logger.error("failed to register MCP server %s: %s", name, e)
+
+
+async def _handle_mcp_tool_call(params: Dict) -> Dict:
+    """Handle an MCP tool call request from the Codex app-server."""
+    server_name = params.get("server", "")
+    tool_name = params.get("tool", "")
+    arguments = params.get("arguments", {})
+
+    logger.info("MCP tool call: server=%s tool=%s args=%s", server_name, tool_name, json.dumps(arguments)[:200])
+
+    # For now, return a stub response - the actual MCP tool execution
+    # would require calling the MCP server's tool endpoint
+    return {
+        "content": [{"type": "text", "text": f"MCP tool {server_name}/{tool_name} called with {json.dumps(arguments)[:100]}"}],
+        "isError": False,
+    }
+
 
 async def _start_thread(session_id: str, user_text: str) -> str:
     """Start a Codex thread and return its ID.
