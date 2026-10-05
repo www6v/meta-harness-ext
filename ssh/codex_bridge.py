@@ -210,6 +210,7 @@ class CodexWSClient:
 
         try:
             result = await asyncio.wait_for(future, timeout=timeout)
+            logger.debug("← %s (id=%d) result=%s", method, req_id, json.dumps(result)[:500])
             return result
         except asyncio.TimeoutError:
             self._pending.pop(req_id, None)
@@ -310,17 +311,29 @@ async def codex_turn(req: TurnRequest):
         user_text = _extract_user_message(req.events)
 
         # Start or reuse a thread
-        thread_result = await _client.call("thread/start", {
-            "instructions": user_text or "",
-        })
-        thread_id = thread_result.get("threadId", "unknown")
+        thread_id = await _start_thread(req.session_id, user_text)
 
         # Start the turn
+        # Codex expects input as a list of content blocks, not a plain string
+        input_blocks = [{"type": "text", "text": user_text}] if user_text else []
         turn_result = await _client.call("turn/start", {
             "threadId": thread_id,
-            "input": user_text or "",
+            "input": input_blocks,
         })
-        turn_id = turn_result.get("turnId", "unknown")
+
+        logger.debug("turn/start response: %s", json.dumps(turn_result)[:500])
+
+        # Extract turn ID - Codex returns it in result.turn.id
+        turn_id = (
+            turn_result.get("turnId")
+            or turn_result.get("turn_id")
+            or turn_result.get("id")
+        )
+        if not turn_id and isinstance(turn_result.get("turn"), dict):
+            turn_id = turn_result["turn"].get("id")
+
+        if not turn_id:
+            raise RuntimeError(f"Codex turn/start returned no turn ID: {turn_result}")
 
         # Wait for turn completion (collect notifications)
         events = await _wait_for_turn_completion(turn_id, timeout=300)
@@ -356,19 +369,30 @@ async def codex_turn_sse(req: TurnRequest):
         try:
             user_text = _extract_user_message(req.events)
 
-            thread_result = await _client.call("thread/start", {
-                "instructions": user_text or "",
-            })
-            thread_id = thread_result.get("threadId", "unknown")
+            thread_id = await _start_thread(req.session_id, user_text)
 
+            # Codex expects input as a list of content blocks, not a plain string
+            input_blocks = [{"type": "text", "text": user_text}] if user_text else []
             turn_result = await _client.call("turn/start", {
                 "threadId": thread_id,
-                "input": user_text or "",
+                "input": input_blocks,
             })
 
+            logger.debug("turn/start response: %s", json.dumps(turn_result)[:500])
+
+            # Extract turn ID - Codex returns it in result.turn.id
+            turn_id = (
+                turn_result.get("turnId")
+                or turn_result.get("turn_id")
+                or turn_result.get("id")
+            )
+            if not turn_id and isinstance(turn_result.get("turn"), dict):
+                turn_id = turn_result["turn"].get("id")
+
             # Stream events as they come
-            async for event in _stream_turn_events(turn_result.get("turnId")):
-                yield f"data: {json.dumps(event)}\n\n"
+            if turn_id:
+                async for event in _stream_turn_events(turn_id):
+                    yield f"data: {json.dumps(event)}\n\n"
 
             yield "data: {\"type\": \"done\"}\n\n"
 
@@ -386,6 +410,44 @@ async def codex_turn_sse(req: TurnRequest):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+async def _start_thread(session_id: str, user_text: str) -> str:
+    """Start a Codex thread and return its ID.
+
+    The Codex app-server may return the thread ID in different field names
+    (threadId, thread_id, id, or nested in thread.id), so we check multiple
+    possibilities.
+    """
+    thread_result = await _client.call("thread/start", {
+        "instructions": user_text or "",
+        "sessionId": session_id,
+    })
+
+    logger.debug("thread/start response: %s", json.dumps(thread_result)[:500])
+
+    # Try multiple field names for thread ID
+    thread_id = (
+        thread_result.get("threadId")
+        or thread_result.get("thread_id")
+        or thread_result.get("id")
+    )
+
+    # Check nested thread.id (real Codex app-server returns {thread: {id: ...}})
+    if not thread_id and isinstance(thread_result.get("thread"), dict):
+        thread_id = thread_result["thread"].get("id")
+
+    if not thread_id:
+        logger.error(
+            "thread/start returned no thread ID. session=%s response=%s",
+            session_id, thread_result
+        )
+        raise RuntimeError(
+            f"Codex thread/start returned no thread ID: {thread_result}"
+        )
+
+    logger.debug("started thread %s for session %s", thread_id, session_id)
+    return thread_id
+
 
 def _extract_user_message(events: Optional[list]) -> str:
     """Pull the latest user.message text from the events list."""
