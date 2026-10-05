@@ -472,37 +472,39 @@ async def _wait_for_turn_completion(turn_id: str, timeout: float = 300) -> list:
             method = notif.get("method", "")
             params = notif.get("params", {})
 
-            if method == "item/agentMessage/delta":
-                text = params.get("textDelta", "")
+            logger.debug("notification: method=%s params_keys=%s", method, list(params.keys()) if isinstance(params, dict) else type(params).__name__)
+
+            # Agent message deltas — try multiple method names and field names
+            if method in ("item/agentMessage/delta", "item/agentMessage/textDelta",
+                          "turn/agentMessage/delta", "turn/textDelta"):
+                text = (params.get("textDelta") or params.get("text")
+                        or params.get("delta") or params.get("content") or "")
                 if text:
-                    events.append({
-                        "type": "agent.message",
-                        "content": text,
-                    })
-            elif method == "item/reasoning/textDelta":
-                text = params.get("textDelta", "")
+                    events.append({"type": "agent.message", "content": text})
+            elif method in ("item/reasoning/textDelta", "turn/reasoning/textDelta"):
+                text = params.get("textDelta") or params.get("text") or params.get("delta") or ""
                 if text:
-                    events.append({
-                        "type": "agent.thinking",
-                        "content": text,
-                    })
-            elif method == "item/started":
-                events.append({
-                    "type": "agent.tool_use",
-                    "name": params.get("name", "unknown"),
-                })
-            elif method == "item/completed":
-                events.append({
-                    "type": "agent.tool_result",
-                    "name": params.get("name", "unknown"),
-                })
-            elif method == "turn/completed":
-                return events
+                    events.append({"type": "agent.thinking", "content": text})
+            elif method in ("turn/completed", "turn/statusChanged", "turn/ended"):
+                status = params.get("status", {})
+                if isinstance(status, dict):
+                    stype = status.get("type", "")
+                else:
+                    stype = str(status)
+                if stype in ("complete", "completed", "idle", "done") or method == "turn/completed":
+                    logger.info("turn %s completed (method=%s status=%s)", turn_id, method, stype)
+                    return events
             elif method == "error":
                 events.append({
                     "type": "session.error",
                     "message": params.get("message", "unknown error"),
                 })
+            else:
+                # Catch-all: if the notification has text content, emit it as agent.message
+                text = (params.get("textDelta") or params.get("text")
+                        or params.get("content") or "")
+                if text and "agent" in method.lower():
+                    events.append({"type": "agent.message", "content": text})
 
         await asyncio.sleep(0.1)
 
@@ -519,14 +521,37 @@ async def _stream_turn_events(turn_id: str):
             method = notif.get("method", "")
             params = notif.get("params", {})
 
-            if method == "item/agentMessage/delta":
-                yield {"type": "agent.message", "content": params.get("textDelta", "")}
-            elif method == "item/reasoning/textDelta":
-                yield {"type": "agent.thinking", "content": params.get("textDelta", "")}
-            elif method == "turn/completed":
-                return
+            logger.debug("notification: method=%s params_keys=%s", method, list(params.keys()) if isinstance(params, dict) else type(params).__name__)
+
+            # Agent message deltas — try multiple method names and field names
+            if method in ("item/agentMessage/delta", "item/agentMessage/textDelta",
+                          "turn/agentMessage/delta", "turn/textDelta"):
+                text = (params.get("textDelta") or params.get("text")
+                        or params.get("delta") or params.get("content") or "")
+                if text:
+                    yield {"type": "agent.message", "content": text}
+            elif method in ("item/reasoning/textDelta", "turn/reasoning/textDelta"):
+                text = params.get("textDelta") or params.get("text") or params.get("delta") or ""
+                if text:
+                    yield {"type": "agent.thinking", "content": text}
+            elif method in ("turn/completed", "turn/statusChanged", "turn/ended"):
+                status = params.get("status", {})
+                if isinstance(status, dict):
+                    stype = status.get("type", "")
+                else:
+                    stype = str(status)
+                # Only end on completed/idle/complete status
+                if stype in ("complete", "completed", "idle", "done") or method == "turn/completed":
+                    logger.info("turn %s completed (method=%s status=%s)", turn_id, method, stype)
+                    return
             elif method == "error":
                 yield {"type": "session.error", "message": params.get("message", "")}
+            else:
+                # Catch-all: if the notification has text content, emit it as agent.message
+                text = (params.get("textDelta") or params.get("text")
+                        or params.get("content") or "")
+                if text and "agent" in method.lower():
+                    yield {"type": "agent.message", "content": text}
 
         await asyncio.sleep(0.1)
 
