@@ -495,10 +495,18 @@ async def _start_thread(session_id: str, user_text: str) -> str:
     The Codex app-server may return the thread ID in different field names
     (threadId, thread_id, id, or nested in thread.id), so we check multiple
     possibilities.
+    
+    IMPORTANT: Use a unique session ID for each thread to avoid caching issues.
+    The Codex app-server returns the same thread for the same sessionId,
+    which causes it to return cached responses.
     """
+    import uuid
+    # Use a unique session ID to force creation of a new thread
+    unique_session = f"{session_id}-{uuid.uuid4().hex[:8]}"
+    
     thread_result = await _client.call("thread/start", {
         "instructions": user_text or "",
-        "sessionId": session_id,
+        "sessionId": unique_session,
     })
 
     logger.debug("thread/start response: %s", json.dumps(thread_result)[:500])
