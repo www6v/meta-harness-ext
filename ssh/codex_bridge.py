@@ -333,7 +333,14 @@ async def codex_turn(req: TurnRequest):
 
         # Start the turn
         # Codex expects input as a list of content blocks, not a plain string
-        input_blocks = [{"type": "text", "text": user_text}] if user_text else []
+        # If user_text is empty, use a fallback to avoid sending empty input
+        if user_text:
+            input_blocks = [{"type": "text", "text": user_text}]
+        else:
+            # Fallback: extract any text from events or use a default
+            input_blocks = [{"type": "text", "text": "hello"}]
+            logger.warning("empty user message, using fallback for session %s", req.session_id)
+
         turn_result = await _client.call("turn/start", {
             "threadId": thread_id,
             "input": input_blocks,
@@ -394,7 +401,13 @@ async def codex_turn_sse(req: TurnRequest):
             thread_id = await _start_thread(req.session_id, user_text)
 
             # Codex expects input as a list of content blocks, not a plain string
-            input_blocks = [{"type": "text", "text": user_text}] if user_text else []
+            # If user_text is empty, use a fallback to avoid sending empty input
+            if user_text:
+                input_blocks = [{"type": "text", "text": user_text}]
+            else:
+                input_blocks = [{"type": "text", "text": "hello"}]
+                logger.warning("empty user message, using fallback for session %s", req.session_id)
+
             turn_result = await _client.call("turn/start", {
                 "threadId": thread_id,
                 "input": input_blocks,
@@ -515,14 +528,42 @@ async def _start_thread(session_id: str, user_text: str) -> str:
 
 
 def _extract_user_message(events: Optional[list]) -> str:
-    """Pull the latest user.message text from the events list."""
+    """Pull the latest user.message text from the events list.
+
+    Handles two event formats:
+    - OMA format: {type: "user.message", data: {content: [{text: "..."}]}}
+    - Simple format: {type: "user.message", content: "..."}
+    """
     if not events:
         return ""
     for ev in reversed(events):
-        if isinstance(ev, dict) and ev.get("type") == "user.message":
-            return ev.get("content", "")
-        if isinstance(ev, dict) and ev.get("type") == "user.message":
-            return ev.get("text", "")
+        if not isinstance(ev, dict) or ev.get("type") != "user.message":
+            continue
+
+        # Try OMA format: data.content is an array of content blocks
+        data = ev.get("data")
+        if isinstance(data, dict):
+            content = data.get("content")
+            if isinstance(content, list):
+                # Extract text from content blocks
+                texts = []
+                for block in content:
+                    if isinstance(block, dict):
+                        texts.append(block.get("text", ""))
+                text = "".join(texts)
+                if text:
+                    return text
+            elif isinstance(content, str):
+                return content
+
+        # Try simple format: top-level content or text field
+        content = ev.get("content")
+        if isinstance(content, str) and content:
+            return content
+        text = ev.get("text")
+        if isinstance(text, str) and text:
+            return text
+
     return ""
 
 
