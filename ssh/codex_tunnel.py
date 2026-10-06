@@ -44,6 +44,7 @@ class SSHTunnel:
     ssh_port: int = 22
     local_host: str = "127.0.0.1"
     local_port: int = 0  # 0 = pick a free port
+    ssh_key_path: Optional[str] = None
 
     _ssh: Optional[paramiko.SSHClient] = None
     _transport: Optional[paramiko.Transport] = None
@@ -68,17 +69,27 @@ class SSHTunnel:
             return
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(
-            hostname=self.ssh_host,
-            port=self.ssh_port,
-            username=self.ssh_user,
-            password=self.ssh_password,
-            timeout=30.0,
-            banner_timeout=15.0,
-            auth_timeout=15.0,
-            allow_agent=False,
-            look_for_keys=False,
-        )
+        connect_kwargs: dict = {
+            "hostname": self.ssh_host,
+            "port": self.ssh_port,
+            "username": self.ssh_user,
+            "timeout": 30.0,
+            "banner_timeout": 15.0,
+            "auth_timeout": 15.0,
+        }
+        if self.ssh_key_path:
+            connect_kwargs["key_filename"] = self.ssh_key_path
+            connect_kwargs["look_for_keys"] = False
+            connect_kwargs["allow_agent"] = False
+        elif self.ssh_password:
+            connect_kwargs["password"] = self.ssh_password
+            connect_kwargs["allow_agent"] = False
+            connect_kwargs["look_for_keys"] = False
+        else:
+            # No password or key specified — try default keys
+            connect_kwargs["look_for_keys"] = True
+            connect_kwargs["allow_agent"] = True
+        ssh.connect(**connect_kwargs)
         transport = ssh.get_transport()
         if transport is None:
             ssh.close()

@@ -66,10 +66,12 @@ def _config_from_env() -> dict[str, Any]:
         "ssh_user": os.environ.get("CODEX_SSH_USER", "root"),
         "ssh_password": os.environ.get("CODEX_SSH_PASSWORD"),
         "ssh_port": int(os.environ.get("CODEX_SSH_PORT", "22")),
+        "ssh_key_path": os.environ.get("CODEX_SSH_KEY_PATH"),
         "remote_port": int(os.environ.get("CODEX_REMOTE_PORT", "8765")),
         "listen": os.environ.get("CODEX_LISTEN", "127.0.0.1:8092"),
         "turn_timeout": float(os.environ.get("CODEX_TURN_TIMEOUT", "300")),
         "model": os.environ.get("CODEX_MODEL", "codex"),
+        "mcp_config_path": os.environ.get("CODEX_MCP_CONFIG_PATH", "/tmp/oma-mcp-config.json"),
     }
 
 
@@ -103,9 +105,10 @@ class _ConnPool:
                 self._tunnel = SSHTunnel(
                     ssh_host=self.cfg["ssh_host"],
                     ssh_user=self.cfg["ssh_user"],
-                    ssh_password=self.cfg["ssh_password"],
+                    ssh_password=self.cfg.get("ssh_password"),
                     ssh_port=self.cfg["ssh_port"],
                     remote_port=self.cfg["remote_port"],
+                    ssh_key_path=self.cfg.get("ssh_key_path"),
                 )
                 self._tunnel.start()
             return self._tunnel.local_url
@@ -264,6 +267,31 @@ def _extract_sub_agents(req: dict[str, Any]) -> list[dict[str, Any]]:
     if isinstance(sub, list):
         return [s for s in sub if isinstance(s, dict)]
     return []
+
+
+def _extract_mcp_config(req: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Extract MCP proxy config from the turn request.
+
+    Returns {base, key, servers, session_id} or None if no MCP config.
+    The bridge uses this to write MCP server config to Codex before the turn.
+    """
+    base = req.get("mcp_proxy_base", "")
+    key = req.get("mcp_proxy_api_key", "")
+    agent = req.get("agent") or {}
+    if isinstance(agent, (str, bytes)):
+        try:
+            agent = json.loads(agent)
+        except Exception:
+            agent = {}
+    servers = agent.get("mcp_servers") or []
+    if isinstance(servers, (str, bytes)):
+        try:
+            servers = json.loads(servers)
+        except Exception:
+            servers = []
+    if not base or not servers:
+        return None
+    return {"base": base, "key": key, "servers": servers}
 
 
 def _inject_sub_agents_info(
@@ -471,6 +499,10 @@ class _Handler(BaseHTTPRequestHandler):
         self._json_response(404, {"error": "not found"})
 
     def do_POST(self) -> None:
+        # JSON-RPC proxy endpoint — forwards arbitrary JSON-RPC calls to Codex
+        if self.path in ("/codex/rpc",):
+            self._do_rpc()
+            return
         if self.path not in ("/codex/turn", "/turn", "/codex/turn/sse", "/turn/sse"):
             self._json_response(404, {"error": "not found"})
             return
@@ -534,6 +566,15 @@ class _Handler(BaseHTTPRequestHandler):
                 logger.warning("codex explicit sub-agent failed: %s", e)
                 explicit_sub_agent_events = []
 
+        # Configure MCP servers before the turn so Codex knows about
+        # available MCP tools (e.g. GitHub via OMA proxy).
+        mcp_config = _extract_mcp_config(req)
+        if mcp_config:
+            try:
+                self._setup_mcp_servers(session_id or "default", mcp_config)
+            except Exception as e:
+                logger.warning("codex mcp setup failed (non-fatal): %s", e)
+
         start = time.monotonic()
         try:
             client, _ = self.pool.get_or_create(session_id or "default")
@@ -567,6 +608,127 @@ class _Handler(BaseHTTPRequestHandler):
         if explicit_sub_agent_events:
             response["events"] = explicit_sub_agent_events + response["events"]
         self._json_response(200, response)
+
+    def _do_rpc(self) -> None:
+        """Handle POST /codex/rpc — forward JSON-RPC to the Codex app-server.
+
+        Request body: {"session_id": "...", "method": "...", "params": {...}}
+        Forwards to CodexClient._call() which sends JSON-RPC over WebSocket.
+        Used by Go's ListMCPServerStatus, ReloadMCPServers, ListThreads, ReadThread.
+        """
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        body = self.rfile.read(length) if length else b""
+        try:
+            req = json.loads(body) if body else {}
+        except json.JSONDecodeError as e:
+            self._json_response(400, {"error": {"message": f"invalid json: {e}"}})
+            return
+
+        method = req.get("method", "")
+        if not method:
+            self._json_response(400, {"error": {"message": "method is required"}})
+            return
+
+        params = req.get("params") or {}
+        session_id = req.get("session_id", "default")
+
+        try:
+            client, _ = self.pool.get_or_create(session_id)
+            # Ensure WebSocket is connected before making RPC calls
+            if client._ws is None:
+                self.pool.run(session_id, client.connect())
+            timeout = float(self.pool.cfg.get("turn_timeout", 300))
+            result = self.pool.run(session_id, client._call(method, params, timeout=timeout))
+            self._json_response(200, {"result": result})
+        except Exception as e:
+            logger.exception("codex rpc failed method=%s", method)
+            self._json_response(502, {"error": {"message": str(e)}})
+
+    def _setup_mcp_servers(self, session_id: str, mcp_config: dict[str, Any]) -> None:
+        """Write MCP server config to Codex machine and trigger reload.
+
+        Builds a Codex-compatible MCP config from the OMA proxy details,
+        writes it to the remote Codex machine (via SSH), and calls
+        config/mcpServer/reload so Codex picks up the new servers.
+        """
+        import subprocess
+
+        # Build Codex MCP server config pointing to OMA proxy
+        servers: dict[str, Any] = {}
+        for srv in mcp_config["servers"]:
+            name = srv.get("name", "")
+            if not name:
+                continue
+            # URL uses the OMA MCP proxy with session_id placeholder
+            proxy_url = f"{mcp_config['base'].rstrip('/')}/{session_id}/{name}"
+            server_cfg: dict[str, Any] = {
+                "transport": "streamable_http",
+                "url": proxy_url,
+            }
+            if mcp_config.get("key"):
+                server_cfg["http_headers"] = {
+                    "Authorization": f"Bearer {mcp_config['key']}",
+                }
+            servers[name] = server_cfg
+
+        config_content = json.dumps({"mcp_servers": servers})
+        config_path = self.pool.cfg.get("mcp_config_path", "/tmp/oma-mcp-config.json")
+
+        # Write config to the Codex machine
+        ssh_host = self.pool.cfg.get("ssh_host")
+        ssh_user = self.pool.cfg.get("ssh_user", "root")
+        if ssh_host:
+            try:
+                # Use SSH to write config file to remote machine
+                escaped = config_content.replace("'", "'\\''")
+                cmd = f"echo '{escaped}' > {config_path}"
+                subprocess.run(
+                    ["ssh", "-o", "StrictHostKeyChecking=no",
+                     "-o", "ConnectTimeout=5",
+                     f"{ssh_user}@{ssh_host}", cmd],
+                    capture_output=True, timeout=15,
+                    check=False,
+                )
+                logger.info("codex: wrote MCP config via SSH to %s:%s", ssh_host, config_path)
+            except Exception as e:
+                logger.warning("codex: SSH MCP config write failed: %s", e)
+                # Try fs/writeFile as fallback
+                try:
+                    client, _ = self.pool.get_or_create(session_id)
+                    if client._ws is None:
+                        self.pool.run(session_id, client.connect())
+                    import base64
+                    content_b64 = base64.b64encode(config_content.encode()).decode()
+                    timeout = float(self.pool.cfg.get("turn_timeout", 300))
+                    self.pool.run(session_id, client._call("fs/writeFile", {
+                        "path": config_path,
+                        "content": content_b64,
+                        "encoding": "base64",
+                    }, timeout=timeout))
+                    logger.info("codex: wrote MCP config via fs/writeFile to %s", config_path)
+                except Exception as e2:
+                    logger.warning("codex: fs/writeFile MCP config also failed: %s", e2)
+                    return
+        else:
+            # Local Codex — write directly
+            try:
+                with open(config_path, "w") as f:
+                    f.write(config_content)
+                logger.info("codex: wrote MCP config locally to %s", config_path)
+            except Exception as e:
+                logger.warning("codex: local MCP config write failed: %s", e)
+                return
+
+        # Trigger reload via RPC so Codex picks up new MCP servers
+        try:
+            client, _ = self.pool.get_or_create(session_id)
+            if client._ws is None:
+                self.pool.run(session_id, client.connect())
+            timeout = float(self.pool.cfg.get("turn_timeout", 300))
+            self.pool.run(session_id, client._call("config/mcpServer/reload", {}, timeout=timeout))
+            logger.info("codex: triggered MCP server reload for session=%s", session_id)
+        except Exception as e:
+            logger.warning("codex: MCP reload failed: %s", e)
 
     def _do_post_stream(self) -> None:
         """SSE streaming variant of POST /codex/turn.
@@ -614,6 +776,15 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 logger.warning("codex explicit sub-agent (stream) failed: %s", e)
                 explicit_sub_agent_events = []
+
+        # Configure MCP servers before the turn so Codex knows about
+        # available MCP tools (e.g. GitHub via OMA proxy).
+        mcp_config = _extract_mcp_config(req)
+        if mcp_config:
+            try:
+                self._setup_mcp_servers(session_id or "default", mcp_config)
+            except Exception as e:
+                logger.warning("codex mcp setup (stream) failed (non-fatal): %s", e)
 
         # SSE headers
         self.send_response(200)
